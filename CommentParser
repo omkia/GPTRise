@@ -1,0 +1,108 @@
+import re
+import pymysql
+import xml.etree.ElementTree as ET
+
+# ------------------------------------------
+# 1. CONNECT TO MARIADB
+# ------------------------------------------
+conn = pymysql.connect(
+    host="localhost",
+    user="root",
+    password="",
+    database="stack",
+    charset="utf8mb4",
+    autocommit=False
+)
+cursor = conn.cursor()
+
+# ------------------------------------------
+# 2. COMMENT CLASSIFIER (Heuristic Rules)
+# ------------------------------------------
+
+def classify_comment(text: str) -> str:
+    t = text.lower()
+
+    # ⭐⭐⭐⭐⭐ Critical: Correction / Error spotting / Hallucination detection
+    if re.search(r"\bwrong\b|\bincorrect\b|not true|that's false|no, it|bug|mistake|error in|actually,|this is wrong|cannot|can't be", t):
+        return "Critical"
+
+    # ⭐⭐⭐⭐ Clarification seeking
+    if re.search(r"\bwhy\b|\bhow\b|\bwhat do you mean\b|\bcan you clarify\b|\bwhich one\b|\bare you saying\b|\?", t):
+        return "Clarification Seeking"
+
+    # ⭐⭐⭐⭐ Improvement Suggestions
+    if re.search(r"\byou should\b|\bit's better to\b|preferably\b|consider\b|instead you can\b|use x rather than y|suggest", t):
+        return "Improvement Suggestions"
+
+    # ⭐⭐⭐ Reproducibility / Failure reports
+    if re.search(r"\bdoesn't work\b|not working|fails on|error message|cannot reproduce|version|environment|python \d|\bcrash", t):
+        return "Reproducibility / Failure Reports"
+
+    # ⭐⭐⭐ Moderation / Policy issues
+    if re.search(r"\boff-topic\b|duplicate|flagged|please edit|follow the rules|formatting|too broad|condense\b", t):
+        return "Moderation / Policy Issues"
+
+    # DEFAULT HEURISTICS
+    if "?" in t:
+        return "Clarification Seeking"
+    if "better" in t or "should" in t:
+        return "Improvement Suggestions"
+
+    return "Improvement Suggestions"  # neutral-positive
+
+# ------------------------------------------
+# 3. PREPARED SQL (batched insert)
+# ------------------------------------------
+
+sql = """
+INSERT INTO comments_processed
+(Id, PostId, Score, Text, CreationDate, UserId, CommentClass)
+VALUES (%s,%s,%s,%s,%s,%s,%s)
+"""
+
+batch = []
+batch_size = 5000  # adjust for your system
+
+# ------------------------------------------
+# 4. STREAM & PARSE HUGE XML
+# ------------------------------------------
+
+def stream_comments(xml_path):
+    global batch
+    for event, elem in ET.iterparse(xml_path, events=("end",)):
+        if elem.tag != "row":
+            continue
+
+        Id = elem.attrib.get("Id")
+        PostId = elem.attrib.get("PostId")
+        Score = elem.attrib.get("Score")
+        Text = elem.attrib.get("Text", "")
+        CreationDate = elem.attrib.get("CreationDate")
+        UserId = elem.attrib.get("UserId")
+
+        comment_class = classify_comment(Text)
+
+        batch.append((Id, PostId, Score, Text, CreationDate, UserId, comment_class))
+
+        if len(batch) >= batch_size:
+            cursor.executemany(sql, batch)
+            conn.commit()
+            batch.clear()
+
+        # clean memory
+        elem.clear()
+
+    # final commit
+    if batch:
+        cursor.executemany(sql, batch)
+        conn.commit()
+        batch.clear()
+
+
+# ------------------------------------------
+# 5. RUN
+# ------------------------------------------
+if __name__ == "__main__":
+    stream_comments("comments.xml")
+    cursor.close()
+    conn.close()
